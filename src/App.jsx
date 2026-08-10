@@ -131,7 +131,10 @@ export default function App() {
         accesibles = (data || []).map((r) => r.locales).filter(Boolean).sort((a, b) => a.nombre.localeCompare(b.nombre));
       }
       setLocales(accesibles);
-      setLocalActivo((prev) => prev && accesibles.some((l) => l.id === prev) ? prev : (accesibles[0]?.id ?? null));
+      setLocalActivo((prev) => {
+        if (prev && accesibles.some((l) => l.id === prev)) return prev;
+        return accesibles.length === 1 ? accesibles[0].id : null; // 1 local: entra directo · varios: pantalla de elección
+      });
     } catch (err) {
       setErrorCtx("No se pudo cargar tu información. Revisa la conexión con Supabase.");
     } finally {
@@ -152,6 +155,7 @@ export default function App() {
   if (!session) return <LoginScreen errorCtx={errorCtx} />;
   if (!profile) return <LoginScreen errorCtx={errorCtx} />;
   if (profile.debe_cambiar_password) return <CambiarPasswordScreen profile={profile} onListo={marcarPasswordCambiada} onCancelar={cerrarSesion} />;
+  if (!localActivo && locales.length > 1) return <SeleccionarLocalScreen nombre={profile.nombre} locales={locales} onElegir={setLocalActivo} onLogout={cerrarSesion} />;
   if (!localActivo) return <Pantalla><p className="text-gray-300 text-sm text-center">No tienes ningún local asignado.<br />Contacta al administrador.</p><button onClick={cerrarSesion} className="mt-4 text-xs" style={{ color: "#E3A48E" }}>Cerrar sesión</button></Pantalla>;
 
   return (
@@ -171,6 +175,34 @@ function Pantalla({ children }) {
       <style>{FONTS}</style>
       {children}
     </div>
+  );
+}
+
+// ---------- Selección de local al entrar (cuando hay más de uno) ----------
+function SeleccionarLocalScreen({ nombre, locales, onElegir, onLogout }) {
+  return (
+    <Pantalla>
+      <div className="w-full max-w-md">
+        <div className="text-center mb-6">
+          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-3" style={{ backgroundColor: "#7C9885" }}><Store size={26} className="text-white" /></div>
+          <h1 className="text-white text-xl" style={{ fontFamily: "'Fraunces', serif" }}>Hola {nombre}</h1>
+          <p className="text-gray-300 text-sm mt-1">¿A qué local quieres entrar?</p>
+        </div>
+        <div className="grid gap-3">
+          {locales.map((l) => (
+            <button key={l.id} onClick={() => onElegir(l.id)}
+              className="w-full flex items-center gap-3 px-5 py-4 rounded-2xl text-left transition-colors hover:opacity-90"
+              style={{ backgroundColor: "#FBF9F3" }}>
+              <Store size={20} style={{ color: "#7C9885" }} />
+              <span className="text-[17px]" style={{ fontFamily: "'Fraunces', serif", color: "#2E2E2E" }}>{l.nombre}</span>
+              <span className="ml-auto text-sm" style={{ color: "#7C9885" }}>Entrar →</span>
+            </button>
+          ))}
+        </div>
+        <button onClick={onLogout} className="w-full mt-5 text-xs" style={{ color: "#A9B9AA" }}>Cerrar sesión</button>
+        <p className="text-center text-[11px] mt-3" style={{ color: "#7C8F7E" }}>Podrás cambiar de local en cualquier momento desde la barra lateral.</p>
+      </div>
+    </Pantalla>
   );
 }
 
@@ -328,9 +360,13 @@ function Shell({ profile, locales, localActivo, setLocalActivo, onLogout }) {
       </aside>
 
       <main className="flex-1 p-4 sm:p-6 md:p-8 max-w-6xl pb-20 md:pb-8">
-        {tab === "pacientes" && (P.pacCrear || P.pacEditar || rol === "cosmetologa")
-          ? <Pacientes rol={rol} P={P} localId={localActivo} />
-          : <EnMigracion titulo={NAV.find((n) => n.key === tab)?.label ?? "Módulo"} />}
+        {tab === "pacientes" && (P.pacCrear || P.pacEditar || rol === "cosmetologa") ? (
+          <Pacientes rol={rol} P={P} localId={localActivo} />
+        ) : tab === "usuarios" && P.usuarios ? (
+          <Usuarios profile={profile} locales={locales} />
+        ) : (
+          <EnMigracion titulo={NAV.find((n) => n.key === tab)?.label ?? "Módulo"} />
+        )}
       </main>
     </div>
   );
@@ -578,6 +614,229 @@ function ModalPaciente({ paciente, alteraciones, puedeAlteraciones, onClose, onG
 
       {error && <p className="text-xs mb-3" style={{ color: "#B4694F" }}>{error}</p>}
       <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : "Guardar paciente"}</Boton>
+    </Modal>
+  );
+}
+
+// =====================================================================
+//  Módulo Usuarios (crear/gestionar usuarios y roles desde la app)
+//  Crear/reiniciar/eliminar usuarios llama a la Edge Function
+//  "gestionar-usuario" (service role en el servidor). Editar perfil,
+//  activar/desactivar y asignar locales son updates normales (RLS).
+// =====================================================================
+const ROLES_ASIGNABLES = ["propietario", "asistente", "cosmetologa"];
+const genTemp = () => "kc-" + Math.random().toString(36).slice(2, 8);
+
+function Usuarios({ profile, locales }) {
+  const [usuarios, setUsuarios] = useState([]);
+  const [cargando, setCargando] = useState(true);
+  const [error, setError] = useState("");
+  const [aviso, setAviso] = useState("");
+  const [modal, setModal] = useState(null); // null | "nuevo" | userObj
+  const [ocupado, setOcupado] = useState(false);
+  const puedeAsignarAdmin = profile.rol === "admin";
+
+  const cargar = useCallback(async () => {
+    setCargando(true); setError("");
+    const { data, error } = await supabase.from("usuarios").select("*, usuario_locales(local_id)").order("nombre");
+    if (error) setError("No se pudieron cargar los usuarios: " + error.message);
+    setUsuarios(data || []);
+    setCargando(false);
+  }, []);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const nombreLocales = (u) => {
+    if (u.rol === "admin") return "Todos";
+    const ids = (u.usuario_locales || []).map((x) => x.local_id);
+    return ids.map((id) => locales.find((l) => l.id === id)?.nombre ?? "—").join(", ") || "—";
+  };
+  const puedeTocar = (u) => u.rol !== "admin" || puedeAsignarAdmin;
+
+  // Alta: llama a la Edge Function
+  const crear = async (form) => {
+    const { data, error } = await supabase.functions.invoke("gestionar-usuario", { body: { accion: "crear", ...form } });
+    if (error || data?.error) return { error: data?.error || error?.message || "Error al crear el usuario." };
+    setModal(null);
+    setAviso(`Usuario "${form.nombre}" creado. Su contraseña temporal es: ${form.password}\nEntrégasela; deberá cambiarla en su primer ingreso.`);
+    await cargar();
+    return {};
+  };
+  // Edición de perfil (updates normales con RLS)
+  const editar = async (u, form) => {
+    const { error: e1 } = await supabase.from("usuarios")
+      .update({ username: form.username, nombre: form.nombre, rol: form.rol, profesional: form.rol === "cosmetologa" ? form.profesional : null })
+      .eq("id", u.id);
+    if (e1) return { error: e1.message };
+    await supabase.from("usuario_locales").delete().eq("usuario_id", u.id);
+    if (form.rol !== "admin" && form.locales.length) {
+      const { error: e2 } = await supabase.from("usuario_locales").insert(form.locales.map((l) => ({ usuario_id: u.id, local_id: l })));
+      if (e2) return { error: e2.message };
+    }
+    setModal(null); await cargar();
+    return {};
+  };
+  const reiniciar = async (u) => {
+    if (!confirm(`¿Reiniciar la contraseña de ${u.nombre}?`)) return;
+    setOcupado(true);
+    const { data, error } = await supabase.functions.invoke("gestionar-usuario", { body: { accion: "reset", id: u.id } });
+    setOcupado(false);
+    if (error || data?.error) { setError(data?.error || error?.message); return; }
+    setAviso(`Contraseña temporal de ${u.nombre}: ${data.temp}\nEntrégasela; deberá cambiarla en su próximo ingreso.`);
+    await cargar();
+  };
+  const toggleActivo = async (u) => {
+    if (u.id === profile.id) { setError("No puedes desactivar tu propio usuario."); return; }
+    const { error } = await supabase.from("usuarios").update({ activo: !(u.activo !== false) }).eq("id", u.id);
+    if (error) setError(error.message); else cargar();
+  };
+  const eliminar = async (u) => {
+    if (u.id === profile.id) { setError("No puedes eliminar tu propio usuario."); return; }
+    if (!confirm(`¿Eliminar a ${u.nombre}? Esta acción no se puede deshacer.`)) return;
+    setOcupado(true);
+    const { data, error } = await supabase.functions.invoke("gestionar-usuario", { body: { accion: "eliminar", id: u.id } });
+    setOcupado(false);
+    if (error || data?.error) { setError(data?.error || error?.message); return; }
+    cargar();
+  };
+
+  if (cargando) return <div><SectionTitle eyebrow="Acceso" title="Usuarios y roles" /><Card className="p-8 text-center text-sm text-[#7C8F7E]">Cargando usuarios…</Card></div>;
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Acceso" title="Usuarios y roles" action={<Boton onClick={() => setModal("nuevo")}><Plus size={16} />Nuevo usuario</Boton>} />
+      {error && <Aviso>{error}</Aviso>}
+      {aviso && (
+        <div className="flex items-start justify-between gap-3 mb-4 px-3 py-2 rounded-lg border" style={{ backgroundColor: "#E6EFE6", color: "#4A7350", borderColor: "#CDE0CD" }}>
+          <span className="text-sm whitespace-pre-line">{aviso}</span>
+          <button onClick={() => setAviso("")} className="shrink-0"><X size={16} /></button>
+        </div>
+      )}
+      <p className="text-sm text-[#7C8F7E] mb-4">Crea usuarios con su rol y local(es). Reciben una contraseña temporal que deberán cambiar en su primer ingreso.</p>
+
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm" style={{ minWidth: "720px" }}>
+          <thead>
+            <tr className="text-left text-[#7C8F7E] text-xs uppercase tracking-wide border-b border-[#EFE9DA]" style={{ fontFamily: "'Sora', sans-serif" }}>
+              <th className="px-3 py-2.5 font-medium">Usuario</th><th className="px-3 py-2.5 font-medium">Nombre</th><th className="px-3 py-2.5 font-medium">Rol</th>
+              <th className="px-3 py-2.5 font-medium">Local</th><th className="px-3 py-2.5 font-medium">Estado</th><th className="px-3 py-2.5 font-medium text-right">Acciones</th>
+            </tr>
+          </thead>
+          <tbody>
+            {usuarios.map((u) => {
+              const activo = u.activo !== false;
+              const tocar = puedeTocar(u);
+              return (
+                <tr key={u.id} className="border-b border-[#F4EFE2]">
+                  <td className="px-3 py-2.5 font-mono text-xs text-[#2E2E2E]">{u.username}{u.id === profile.id && <span className="ml-1 text-[10px]" style={{ color: "#7C9885" }}>(tú)</span>}</td>
+                  <td className="px-3 py-2.5 text-[#2E2E2E]">{u.nombre}{u.profesional ? <span className="text-xs" style={{ color: "#A9B9AA" }}> · {u.profesional}</span> : null}</td>
+                  <td className="px-3 py-2.5"><span className="text-[10px] px-2 py-0.5 rounded-full" style={{ backgroundColor: u.rol === "admin" ? "#2E2E2E" : u.rol === "propietario" ? "#E6EFE6" : u.rol === "asistente" ? "#EEE9DC" : "#F5E9DE", color: u.rol === "admin" ? "#fff" : u.rol === "propietario" ? "#4A7350" : u.rol === "asistente" ? "#6A6152" : "#B4694F" }}>{ROLES[u.rol] ?? u.rol}</span></td>
+                  <td className="px-3 py-2.5 text-[#7C8F7E]">{nombreLocales(u)}</td>
+                  <td className="px-3 py-2.5">
+                    {activo ? <span className="text-xs" style={{ color: "#5D8065" }}>Activo</span> : <span className="text-xs" style={{ color: "#B4694F" }}>Inactivo</span>}
+                    {u.debe_cambiar_password && <div className="text-[10px] mt-0.5" style={{ color: "#B4694F" }}>● debe cambiar contraseña</div>}
+                  </td>
+                  <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                    {tocar ? (
+                      <div className="inline-flex items-center gap-3">
+                        <button onClick={() => setModal(u)} className="text-xs" style={{ color: "#7C9885" }}>Editar</button>
+                        {u.id !== profile.id && <button disabled={ocupado} onClick={() => toggleActivo(u)} className="text-xs" style={{ color: "#7C8F7E" }}>{activo ? "Desactivar" : "Activar"}</button>}
+                        <button disabled={ocupado} onClick={() => reiniciar(u)} className="text-xs inline-flex items-center gap-0.5" style={{ color: "#B4694F" }}><Lock size={12} />Reiniciar</button>
+                        {u.id !== profile.id && <button disabled={ocupado} onClick={() => eliminar(u)} className="text-xs" style={{ color: "#B4694F" }}>Eliminar</button>}
+                      </div>
+                    ) : <span className="text-xs" style={{ color: "#C9C2B2" }}>—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+
+      {modal && (
+        <ModalUsuario
+          usuario={modal === "nuevo" ? null : modal}
+          locales={locales}
+          puedeAsignarAdmin={puedeAsignarAdmin}
+          onClose={() => setModal(null)}
+          onCrear={crear}
+          onEditar={editar}
+        />
+      )}
+    </div>
+  );
+}
+
+function ModalUsuario({ usuario, locales, puedeAsignarAdmin, onClose, onCrear, onEditar }) {
+  const editando = !!usuario;
+  const [username, setUsername] = useState(usuario?.username ?? "");
+  const [nombre, setNombre] = useState(usuario?.nombre ?? "");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState(editando ? "" : genTemp());
+  const [rol, setRol] = useState(usuario?.rol ?? "asistente");
+  const [profesional, setProfesional] = useState(usuario?.profesional ?? "");
+  const [locSel, setLocSel] = useState((usuario?.usuario_locales || []).map((x) => x.local_id));
+  const [error, setError] = useState("");
+  const [guardando, setGuardando] = useState(false);
+
+  const rolesDisponibles = puedeAsignarAdmin ? ["admin", ...ROLES_ASIGNABLES] : [...ROLES_ASIGNABLES];
+  const toggleLoc = (id) => setLocSel((a) => a.includes(id) ? a.filter((x) => x !== id) : [...a, id]);
+
+  const submit = async () => {
+    if (!username.trim() || !nombre.trim()) { setError("Usuario y nombre son obligatorios."); return; }
+    if (rol !== "admin" && locSel.length === 0) { setError("Selecciona al menos un local."); return; }
+    if (rol === "cosmetologa" && !profesional.trim()) { setError("Indica el nombre de la profesional."); return; }
+    if (!editando && (!email.trim() || password.length < 6)) { setError("Correo válido y contraseña de mínimo 6 caracteres."); return; }
+    setError(""); setGuardando(true);
+    const base = { username: username.trim(), nombre: nombre.trim(), rol, profesional: profesional.trim(), locales: rol === "admin" ? [] : locSel };
+    const res = editando
+      ? await onEditar(usuario, base)
+      : await onCrear({ ...base, email: email.trim(), password });
+    setGuardando(false);
+    if (res?.error) setError(res.error);
+  };
+
+  return (
+    <Modal title={editando ? "Editar usuario" : "Nuevo usuario"} onClose={onClose}>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Usuario (identificador)"><input value={username} onChange={(e) => setUsername(e.target.value)} className={inputClass} placeholder="ej. maria" autoFocus /></Field>
+        <Field label="Rol"><select value={rol} onChange={(e) => setRol(e.target.value)} className={inputClass}>{rolesDisponibles.map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}</select></Field>
+      </div>
+      <Field label="Nombre de la persona"><input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputClass} placeholder="ej. María Pérez" /></Field>
+
+      {!editando && (
+        <>
+          <Field label="Correo (será su usuario de acceso)"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} placeholder="correo@ejemplo.com" /></Field>
+          <Field label="Contraseña temporal">
+            <div className="flex items-center gap-2">
+              <input value={password} onChange={(e) => setPassword(e.target.value)} className={`${inputClass} flex-1 font-mono`} />
+              <button onClick={() => setPassword(genTemp())} className="text-xs px-2 py-2 rounded-lg border shrink-0" style={{ borderColor: "#DDD6C2", color: "#7C8F7E" }}>Generar</button>
+            </div>
+            <p className="text-[11px] mt-1" style={{ color: "#A9B9AA" }}>Deberá cambiarla en su primer ingreso.</p>
+          </Field>
+        </>
+      )}
+      {editando && <p className="text-xs mb-4" style={{ color: "#A9B9AA" }}>El correo y la contraseña no se editan aquí. Si la olvidó, usa "Reiniciar" en la lista.</p>}
+
+      {rol === "admin" ? (
+        <p className="text-xs mb-4 px-3 py-2 rounded-lg" style={{ backgroundColor: "#FBF9F3", border: "1px solid #E7E1D2", color: "#7C8F7E" }}>El Administrador tiene acceso a todos los locales.</p>
+      ) : (
+        <div className="mb-4">
+          <span className="block text-[13px] text-[#5E6E5F] mb-1.5" style={{ fontFamily: "'Sora', sans-serif" }}>Local(es) asignado(s)</span>
+          <div className="flex flex-wrap gap-2">
+            {locales.map((l) => {
+              const sel = locSel.includes(l.id);
+              return <button key={l.id} type="button" onClick={() => toggleLoc(l.id)} className="text-xs px-3 py-1.5 rounded-full border" style={sel ? { backgroundColor: "#7C9885", color: "#fff", borderColor: "#7C9885" } : { backgroundColor: "#fff", color: "#5E6E5F", borderColor: "#DDD6C2" }}>{sel && <Check size={12} className="inline mr-1" />}{l.nombre}</button>;
+            })}
+          </div>
+        </div>
+      )}
+
+      {rol === "cosmetologa" && (
+        <Field label="Profesional vinculada (verá solo sus citas)"><input value={profesional} onChange={(e) => setProfesional(e.target.value)} className={inputClass} placeholder="ej. Grace" /></Field>
+      )}
+
+      {error && <p className="text-xs mb-3" style={{ color: "#B4694F" }}>{error}</p>}
+      <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : editando ? "Guardar cambios" : "Crear usuario"}</Boton>
     </Modal>
   );
 }
