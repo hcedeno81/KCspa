@@ -360,13 +360,13 @@ function Shell({ profile, locales, localActivo, setLocalActivo, onLogout }) {
       </aside>
 
       <main className="flex-1 p-4 sm:p-6 md:p-8 max-w-6xl pb-20 md:pb-8">
-        {tab === "pacientes" && (P.pacCrear || P.pacEditar || rol === "cosmetologa") ? (
-          <Pacientes rol={rol} P={P} localId={localActivo} />
-        ) : tab === "usuarios" && P.usuarios ? (
-          <Usuarios profile={profile} locales={locales} />
-        ) : (
-          <EnMigracion titulo={NAV.find((n) => n.key === tab)?.label ?? "Módulo"} />
-        )}
+        {(() => {
+          if (tab === "pacientes" && (P.pacCrear || P.pacEditar || rol === "cosmetologa")) return <Pacientes rol={rol} P={P} localId={localActivo} />;
+          if (tab === "usuarios" && P.usuarios) return <Usuarios profile={profile} locales={locales} />;
+          if (tab === "maestros" && P.maestros) return <Maestros localId={localActivo} />;
+          if (tab === "inventario" && P.inventario) return <Inventario rol={rol} localId={localActivo} />;
+          return <EnMigracion titulo={NAV.find((n) => n.key === tab)?.label ?? "Módulo"} />;
+        })()}
       </main>
     </div>
   );
@@ -837,6 +837,293 @@ function ModalUsuario({ usuario, locales, puedeAsignarAdmin, onClose, onCrear, o
 
       {error && <p className="text-xs mb-3" style={{ color: "#B4694F" }}>{error}</p>}
       <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : editando ? "Guardar cambios" : "Crear usuario"}</Boton>
+    </Modal>
+  );
+}
+
+// =====================================================================
+//  Inventario (stock) — sobre Supabase
+//  Ajuste de stock ±. La disminución de la asistente la bloquea el
+//  trigger de la base (candado real), no solo la UI.
+// =====================================================================
+const UNIDADES = ["unidades", "ml", "g", "kg", "l", "cajas", "paquetes"];
+
+function Inventario({ rol, localId }) {
+  const [items, setItems] = useState([]);
+  const [cargando, setCargando] = useState(true);
+  const [error, setError] = useState("");
+  const [filtro, setFiltro] = useState("todos");
+  const [busqueda, setBusqueda] = useState("");
+  const puedeDisminuir = rol === "admin" || rol === "propietario";
+
+  const cargar = useCallback(async () => {
+    setCargando(true); setError("");
+    const { data, error } = await supabase.from("inventario").select("*").eq("local_id", localId).order("nombre");
+    if (error) setError("No se pudo cargar el inventario: " + error.message);
+    setItems(data || []);
+    setCargando(false);
+  }, [localId]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const ajustar = async (item, delta) => {
+    const nuevo = Math.max(0, Number(item.stock) + delta);
+    const { error } = await supabase.from("inventario").update({ stock: nuevo }).eq("id", item.id);
+    if (error) { setError(delta < 0 ? "Tu rol solo puede aumentar el inventario, no disminuirlo." : error.message); return; }
+    setItems((xs) => xs.map((x) => (x.id === item.id ? { ...x, stock: nuevo } : x)));
+  };
+
+  const q = busqueda.trim().toLowerCase();
+  const lista = items.filter((i) => (filtro === "todos" || i.tipo === filtro) && (!q || i.nombre.toLowerCase().includes(q) || (i.categoria || "").toLowerCase().includes(q)))
+    .sort((a, b) => { const ab = Number(a.stock) <= Number(a.stock_minimo), bb = Number(b.stock) <= Number(b.stock_minimo); if (ab !== bb) return ab ? -1 : 1; return a.nombre.localeCompare(b.nombre); });
+  const bajos = items.filter((i) => Number(i.stock) <= Number(i.stock_minimo)).length;
+
+  if (cargando) return <div><SectionTitle eyebrow="Stock" title="Inventario" /><Card className="p-8 text-center text-sm text-[#7C8F7E]">Cargando…</Card></div>;
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Stock" title="Inventario" />
+      {error && <Aviso>{error}</Aviso>}
+      <p className="text-xs text-[#7C8F7E] mb-4">{puedeDisminuir ? "Ajusta el stock con ±. Los ítems se crean y editan en Maestros." : "Tu rol solo puede AUMENTAR el stock; el botón − está deshabilitado."}</p>
+      {bajos > 0 && <Aviso>{bajos} ítem(s) por debajo del stock mínimo.</Aviso>}
+
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="relative flex-1 min-w-[180px] max-w-sm">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A9B9AA]" />
+          <input value={busqueda} onChange={(e) => setBusqueda(e.target.value)} placeholder="Buscar…" className={`${inputClass} pl-9`} />
+        </div>
+        {[["todos", "Todos"], ["insumo", "Insumos"], ["producto", "Productos"]].map(([v, t]) => (
+          <button key={v} onClick={() => setFiltro(v)} className="px-3 py-1.5 rounded-lg text-sm border" style={filtro === v ? { backgroundColor: "#2E2E2E", color: "#fff", borderColor: "#2E2E2E" } : { backgroundColor: "#fff", color: "#7C8F7E", borderColor: "#DDD6C2" }}>{t}</button>
+        ))}
+      </div>
+
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm" style={{ minWidth: "640px" }}>
+          <thead>
+            <tr className="text-left text-[#7C8F7E] text-xs uppercase tracking-wide border-b border-[#EFE9DA]" style={{ fontFamily: "'Sora', sans-serif" }}>
+              <th className="px-3 py-2.5 font-medium">Nombre</th><th className="px-3 py-2.5 font-medium">Tipo</th><th className="px-3 py-2.5 font-medium">Categoría</th>
+              <th className="px-3 py-2.5 font-medium text-right">Precio</th><th className="px-3 py-2.5 font-medium text-right">Stock</th><th className="px-3 py-2.5 font-medium text-right">Mínimo</th><th className="px-3 py-2.5 font-medium text-center">Ajustar</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lista.map((i) => {
+              const bajo = Number(i.stock) <= Number(i.stock_minimo);
+              const prod = i.tipo === "producto";
+              return (
+                <tr key={i.id} className="border-b border-[#F4EFE2]" style={bajo ? { backgroundColor: "#FCF3EC" } : undefined}>
+                  <td className="px-3 py-2.5 text-[#2E2E2E]">{i.nombre}{bajo && <span className="ml-2 text-[10px]" style={{ color: "#B4694F" }}>● bajo</span>}</td>
+                  <td className="px-3 py-2.5"><span className="text-[10px] px-2 py-0.5 rounded-full" style={prod ? { backgroundColor: "#EEE9DC", color: "#6A6152" } : { backgroundColor: "#E6EFE6", color: "#4A7350" }}>{prod ? "Producto" : "Insumo"}</span></td>
+                  <td className="px-3 py-2.5 text-[#7C8F7E]">{i.categoria || "—"}</td>
+                  <td className="px-3 py-2.5 text-right text-[#7C8F7E]">{prod ? `$${Number(i.precio).toFixed(2)}` : "—"}</td>
+                  <td className="px-3 py-2.5 text-right" style={{ color: bajo ? "#B4694F" : "#2E2E2E" }}>{i.stock} {i.unidad}</td>
+                  <td className="px-3 py-2.5 text-right text-[#7C8F7E]">{i.stock_minimo}</td>
+                  <td className="px-3 py-2.5">
+                    <div className="flex items-center justify-center gap-1">
+                      <button onClick={() => ajustar(i, -1)} disabled={!puedeDisminuir} title={puedeDisminuir ? "Disminuir" : "No permitido para tu rol"} className="w-7 h-7 rounded-md border border-[#DDD6C2] bg-white flex items-center justify-center text-[#2E2E2E] hover:bg-[#F6F1E4] disabled:opacity-30 disabled:cursor-not-allowed"><Minus size={13} /></button>
+                      <button onClick={() => ajustar(i, 1)} className="w-7 h-7 rounded-md border border-[#DDD6C2] bg-white flex items-center justify-center text-[#2E2E2E] hover:bg-[#F6F1E4]"><Plus size={13} /></button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {lista.length === 0 && <tr><td colSpan={7} className="px-3 py-6 text-center text-[#7C8F7E]">Sin ítems. Créalos en Maestros.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+// =====================================================================
+//  Maestros (tratamientos / insumos / productos) — sobre Supabase
+// =====================================================================
+function Maestros({ localId }) {
+  const [seccion, setSeccion] = useState("tratamientos");
+  const [servicios, setServicios] = useState([]);
+  const [inventario, setInventario] = useState([]);
+  const [cargando, setCargando] = useState(true);
+  const [error, setError] = useState("");
+  const [modalServ, setModalServ] = useState(null); // null | "nuevo" | servicioObj
+  const [modalItem, setModalItem] = useState(null); // null | {tipo} | itemObj
+
+  const cargar = useCallback(async () => {
+    setCargando(true); setError("");
+    const [{ data: sv, error: e1 }, { data: inv, error: e2 }] = await Promise.all([
+      supabase.from("servicios").select("*, servicio_insumos(insumo_id, cantidad)").eq("local_id", localId).order("nombre"),
+      supabase.from("inventario").select("*").eq("local_id", localId).order("nombre"),
+    ]);
+    if (e1 || e2) setError((e1 || e2).message);
+    setServicios(sv || []); setInventario(inv || []);
+    setCargando(false);
+  }, [localId]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const insumos = inventario.filter((i) => i.tipo === "insumo");
+  const productos = inventario.filter((i) => i.tipo === "producto");
+  const nombreInsumo = (id) => insumos.find((i) => i.id === id)?.nombre ?? "—";
+
+  const guardarServicio = async (form, bom, id) => {
+    let servId = id;
+    if (id) { const { error } = await supabase.from("servicios").update(form).eq("id", id); if (error) return { error: error.message }; }
+    else { const { data, error } = await supabase.from("servicios").insert({ ...form, local_id: localId }).select("id").single(); if (error) return { error: error.message }; servId = data.id; }
+    await supabase.from("servicio_insumos").delete().eq("servicio_id", servId);
+    if (bom.length) { const { error } = await supabase.from("servicio_insumos").insert(bom.map((b) => ({ servicio_id: servId, insumo_id: b.insumo_id, cantidad: b.cantidad }))); if (error) return { error: error.message }; }
+    setModalServ(null); await cargar(); return {};
+  };
+  const eliminarServicio = async (s) => { if (!confirm(`¿Eliminar "${s.nombre}"?`)) return; const { error } = await supabase.from("servicios").delete().eq("id", s.id); if (error) setError(error.message); else cargar(); };
+  const guardarItem = async (form, id) => {
+    if (id) { const { error } = await supabase.from("inventario").update(form).eq("id", id); if (error) return { error: error.message }; }
+    else { const { error } = await supabase.from("inventario").insert({ ...form, local_id: localId }); if (error) return { error: error.message }; }
+    setModalItem(null); await cargar(); return {};
+  };
+  const eliminarItem = async (it) => { if (!confirm(`¿Eliminar "${it.nombre}"?`)) return; const { error } = await supabase.from("inventario").delete().eq("id", it.id); if (error) setError(error.message); else cargar(); };
+
+  const tabBtn = (v, t) => <button key={v} onClick={() => setSeccion(v)} className="px-3 py-1.5 rounded-lg text-sm border" style={seccion === v ? { backgroundColor: "#2E2E2E", color: "#fff", borderColor: "#2E2E2E" } : { backgroundColor: "#fff", color: "#7C8F7E", borderColor: "#DDD6C2" }}>{t}</button>;
+
+  if (cargando) return <div><SectionTitle eyebrow="Catálogos" title="Maestros" /><Card className="p-8 text-center text-sm text-[#7C8F7E]">Cargando…</Card></div>;
+
+  const accion = seccion === "tratamientos"
+    ? <Boton onClick={() => setModalServ("nuevo")}><Plus size={16} />Nuevo tratamiento</Boton>
+    : <Boton onClick={() => setModalItem({ tipo: seccion === "insumos" ? "insumo" : "producto" })}><Plus size={16} />Nuevo {seccion === "insumos" ? "insumo" : "producto"}</Boton>;
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Catálogos" title="Maestros" action={accion} />
+      {error && <Aviso>{error}</Aviso>}
+      <div className="flex flex-wrap gap-2 mb-4">{tabBtn("tratamientos", "Tratamientos")}{tabBtn("insumos", "Insumos")}{tabBtn("productos", "Productos")}</div>
+
+      {seccion === "tratamientos" && (
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm" style={{ minWidth: "620px" }}>
+            <thead><tr className="text-left text-[#7C8F7E] text-xs uppercase tracking-wide border-b border-[#EFE9DA]" style={{ fontFamily: "'Sora', sans-serif" }}><th className="px-3 py-2.5 font-medium">Código</th><th className="px-3 py-2.5 font-medium">Tratamiento</th><th className="px-3 py-2.5 font-medium text-right">Duración</th><th className="px-3 py-2.5 font-medium text-right">Precio</th><th className="px-3 py-2.5 font-medium">Insumos</th><th className="px-3 py-2.5 font-medium text-right">Acciones</th></tr></thead>
+            <tbody>
+              {servicios.map((s) => (
+                <tr key={s.id} className="border-b border-[#F4EFE2]">
+                  <td className="px-3 py-2.5 font-mono text-xs text-[#7C9885]">{s.codigo || "—"}</td>
+                  <td className="px-3 py-2.5 text-[#2E2E2E]">{s.nombre}</td>
+                  <td className="px-3 py-2.5 text-right text-[#7C8F7E]">{s.duracion} min</td>
+                  <td className="px-3 py-2.5 text-right text-[#2E2E2E]">${Number(s.precio).toFixed(2)}</td>
+                  <td className="px-3 py-2.5 text-xs text-[#7C9885]">{(s.servicio_insumos || []).length ? s.servicio_insumos.map((b) => `${b.cantidad} ${nombreInsumo(b.insumo_id)}`).join(", ") : "—"}</td>
+                  <td className="px-3 py-2.5 text-right whitespace-nowrap"><button onClick={() => setModalServ(s)} className="text-xs mr-3" style={{ color: "#7C9885" }}>Editar</button><button onClick={() => eliminarServicio(s)} className="text-xs" style={{ color: "#B4694F" }}>Eliminar</button></td>
+                </tr>
+              ))}
+              {servicios.length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-[#7C8F7E]">Sin tratamientos.</td></tr>}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {(seccion === "insumos" || seccion === "productos") && (
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm" style={{ minWidth: "620px" }}>
+            <thead><tr className="text-left text-[#7C8F7E] text-xs uppercase tracking-wide border-b border-[#EFE9DA]" style={{ fontFamily: "'Sora', sans-serif" }}><th className="px-3 py-2.5 font-medium">Código</th><th className="px-3 py-2.5 font-medium">Nombre</th><th className="px-3 py-2.5 font-medium">Categoría</th><th className="px-3 py-2.5 font-medium">Unidad</th>{seccion === "productos" ? <th className="px-3 py-2.5 font-medium text-right">Precio</th> : <th className="px-3 py-2.5 font-medium text-right">Stock mín.</th>}<th className="px-3 py-2.5 font-medium text-right">Acciones</th></tr></thead>
+            <tbody>
+              {(seccion === "insumos" ? insumos : productos).map((i) => (
+                <tr key={i.id} className="border-b border-[#F4EFE2]">
+                  <td className="px-3 py-2.5 font-mono text-xs text-[#7C9885]">{i.codigo || "—"}</td>
+                  <td className="px-3 py-2.5 text-[#2E2E2E]">{i.nombre}</td>
+                  <td className="px-3 py-2.5 text-[#7C8F7E]">{i.categoria || "—"}</td>
+                  <td className="px-3 py-2.5 text-[#7C8F7E]">{i.unidad}</td>
+                  {seccion === "productos" ? <td className="px-3 py-2.5 text-right text-[#2E2E2E]">${Number(i.precio).toFixed(2)}</td> : <td className="px-3 py-2.5 text-right text-[#7C8F7E]">{i.stock_minimo}</td>}
+                  <td className="px-3 py-2.5 text-right whitespace-nowrap"><button onClick={() => setModalItem(i)} className="text-xs mr-3" style={{ color: "#7C9885" }}>Editar</button><button onClick={() => eliminarItem(i)} className="text-xs" style={{ color: "#B4694F" }}>Eliminar</button></td>
+                </tr>
+              ))}
+              {(seccion === "insumos" ? insumos : productos).length === 0 && <tr><td colSpan={6} className="px-3 py-6 text-center text-[#7C8F7E]">Sin {seccion}.</td></tr>}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {modalServ && <ModalServicio servicio={modalServ === "nuevo" ? null : modalServ} insumos={insumos} onClose={() => setModalServ(null)} onGuardar={guardarServicio} />}
+      {modalItem && <ModalItemInv item={modalItem.tipo ? null : modalItem} tipoFijo={modalItem.tipo} onClose={() => setModalItem(null)} onGuardar={guardarItem} />}
+    </div>
+  );
+}
+
+function ModalServicio({ servicio, insumos, onClose, onGuardar }) {
+  const [codigo, setCodigo] = useState(servicio?.codigo ?? "");
+  const [nombre, setNombre] = useState(servicio?.nombre ?? "");
+  const [duracion, setDuracion] = useState(servicio?.duracion ?? 30);
+  const [precio, setPrecio] = useState(servicio?.precio ?? "");
+  const [bom, setBom] = useState((servicio?.servicio_insumos || []).map((b) => ({ insumo_id: b.insumo_id, cantidad: b.cantidad })));
+  const [error, setError] = useState(""); const [guardando, setGuardando] = useState(false);
+  const addBom = () => setBom((b) => [...b, { insumo_id: insumos[0]?.id ?? "", cantidad: 1 }]);
+  const setBomRow = (i, k, v) => setBom((b) => b.map((r, j) => (j === i ? { ...r, [k]: v } : r)));
+  const delBom = (i) => setBom((b) => b.filter((_, j) => j !== i));
+
+  const submit = async () => {
+    if (!nombre.trim()) { setError("Escribe el nombre."); return; }
+    if (precio === "") { setError("Indica el precio."); return; }
+    setError(""); setGuardando(true);
+    const res = await onGuardar({ codigo: codigo.trim() || null, nombre: nombre.trim(), duracion: parseInt(duracion) || 0, precio: parseFloat(precio) || 0 }, bom.filter((r) => r.insumo_id), servicio?.id);
+    setGuardando(false); if (res?.error) setError(res.error);
+  };
+
+  return (
+    <Modal title={servicio ? "Editar tratamiento" : "Nuevo tratamiento"} onClose={onClose}>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Código"><input value={codigo} onChange={(e) => setCodigo(e.target.value)} className={inputClass} placeholder="SERV-001" /></Field>
+        <div className="col-span-2"><Field label="Nombre"><input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputClass} autoFocus /></Field></div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Duración (min)"><input type="number" min="0" step="5" value={duracion} onChange={(e) => setDuracion(e.target.value)} className={inputClass} /></Field>
+        <Field label="Precio (USD)"><input type="number" min="0" step="0.5" value={precio} onChange={(e) => setPrecio(e.target.value)} className={inputClass} placeholder="0.00" /></Field>
+      </div>
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-1.5"><span className="text-[13px] text-[#5E6E5F]" style={{ fontFamily: "'Sora', sans-serif" }}>Insumos que consume</span><button onClick={addBom} className="text-xs text-[#7C9885]">+ Agregar</button></div>
+        {bom.length === 0 && <p className="text-xs text-[#A9B9AA]">Ninguno.</p>}
+        <div className="space-y-2">
+          {bom.map((r, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <select value={r.insumo_id} onChange={(e) => setBomRow(i, "insumo_id", e.target.value)} className={inputClass} style={{ flex: "1 1 auto", minWidth: 0 }}>{insumos.map((x) => <option key={x.id} value={x.id}>{x.nombre} ({x.unidad})</option>)}</select>
+              <input type="number" min="0" step="0.1" value={r.cantidad} onChange={(e) => setBomRow(i, "cantidad", parseFloat(e.target.value) || 0)} className={inputClass} style={{ width: "56px", flex: "0 0 56px" }} />
+              <button onClick={() => delBom(i)} className="text-[#B4694F] shrink-0"><X size={16} /></button>
+            </div>
+          ))}
+        </div>
+      </div>
+      {error && <p className="text-xs mb-3" style={{ color: "#B4694F" }}>{error}</p>}
+      <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : "Guardar"}</Boton>
+    </Modal>
+  );
+}
+
+function ModalItemInv({ item, tipoFijo, onClose, onGuardar }) {
+  const [tipo, setTipo] = useState(item?.tipo ?? tipoFijo ?? "insumo");
+  const [codigo, setCodigo] = useState(item?.codigo ?? "");
+  const [nombre, setNombre] = useState(item?.nombre ?? "");
+  const [categoria, setCategoria] = useState(item?.categoria ?? "");
+  const [unidad, setUnidad] = useState(item?.unidad ?? "unidades");
+  const [stock, setStock] = useState(item?.stock ?? "");
+  const [stockMin, setStockMin] = useState(item?.stock_minimo ?? "");
+  const [precio, setPrecio] = useState(item?.precio ?? "");
+  const [error, setError] = useState(""); const [guardando, setGuardando] = useState(false);
+
+  const submit = async () => {
+    if (!nombre.trim() || stock === "" || stockMin === "") { setError("Completa nombre, stock y stock mínimo."); return; }
+    if (tipo === "producto" && precio === "") { setError("Un producto necesita precio."); return; }
+    setError(""); setGuardando(true);
+    const res = await onGuardar({ tipo, codigo: codigo.trim() || null, nombre: nombre.trim(), categoria: categoria.trim() || null, unidad, stock: parseFloat(stock) || 0, stock_minimo: parseFloat(stockMin) || 0, precio: tipo === "producto" ? (parseFloat(precio) || 0) : 0 }, item?.id);
+    setGuardando(false); if (res?.error) setError(res.error);
+  };
+
+  return (
+    <Modal title={item ? "Editar ítem" : `Nuevo ${tipo}`} onClose={onClose}>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Código"><input value={codigo} onChange={(e) => setCodigo(e.target.value)} className={inputClass} placeholder={tipo === "producto" ? "PRD-001" : "INS-001"} /></Field>
+        <div className="col-span-2"><Field label="Tipo"><select value={tipo} onChange={(e) => setTipo(e.target.value)} className={inputClass} disabled={!!tipoFijo && !item}><option value="insumo">Insumo</option><option value="producto">Producto</option></select></Field></div>
+      </div>
+      <Field label="Nombre"><input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputClass} autoFocus /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Categoría"><input value={categoria} onChange={(e) => setCategoria(e.target.value)} className={inputClass} placeholder="General" /></Field>
+        <Field label="Unidad"><select value={unidad} onChange={(e) => setUnidad(e.target.value)} className={inputClass}>{UNIDADES.map((u) => <option key={u}>{u}</option>)}</select></Field>
+      </div>
+      {tipo === "producto" && <Field label="Precio de venta (USD)"><input type="number" min="0" step="0.5" value={precio} onChange={(e) => setPrecio(e.target.value)} className={inputClass} placeholder="0.00" /></Field>}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label={item ? "Stock actual" : "Stock inicial"}><input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} className={inputClass} placeholder="0" /></Field>
+        <Field label="Stock mínimo"><input type="number" min="0" step="1" value={stockMin} onChange={(e) => setStockMin(e.target.value)} className={inputClass} placeholder="0" /></Field>
+      </div>
+      {error && <p className="text-xs mb-3" style={{ color: "#B4694F" }}>{error}</p>}
+      <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : "Guardar"}</Boton>
     </Modal>
   );
 }
