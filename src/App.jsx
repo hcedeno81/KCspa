@@ -60,10 +60,10 @@ async function authUpdatePassword(url, anonKey, token, password) {
 // ---------- Roles / permisos ----------
 const ROLES = { admin: "Administrador", propietario: "Propietario", asistente: "Asistente", cosmetologa: "Cosmetóloga" };
 const PERMISOS = {
-  admin:       { pacientes: true, pacCrear: true, pacEditar: true, pacEliminar: true, pacAlteraciones: true, inventario: true, invDisminuir: true, maestros: true, agenda: true, usuarios: true },
-  propietario: { pacientes: true, pacCrear: true, pacEditar: true, pacEliminar: true, pacAlteraciones: true, inventario: true, invDisminuir: true, maestros: true, agenda: true, usuarios: true },
-  asistente:   { pacientes: true, pacCrear: true, pacEditar: false, pacEliminar: false, pacAlteraciones: false, inventario: true, invDisminuir: false, maestros: false, agenda: true, usuarios: false },
-  cosmetologa: { pacientes: true, pacCrear: false, pacEditar: false, pacEliminar: false, pacAlteraciones: false, inventario: false, invDisminuir: false, maestros: false, agenda: true, usuarios: false },
+  admin:       { pacientes: true, pacCrear: true, pacEditar: true, pacEliminar: true, pacAlteraciones: true, inventario: true, invDisminuir: true, maestros: true, agenda: true, atenciones: true, usuarios: true },
+  propietario: { pacientes: true, pacCrear: true, pacEditar: true, pacEliminar: true, pacAlteraciones: true, inventario: true, invDisminuir: true, maestros: true, agenda: true, atenciones: true, usuarios: true },
+  asistente:   { pacientes: true, pacCrear: true, pacEditar: false, pacEliminar: false, pacAlteraciones: false, inventario: true, invDisminuir: false, maestros: false, agenda: true, atenciones: true, usuarios: false },
+  cosmetologa: { pacientes: true, pacCrear: false, pacEditar: false, pacEliminar: false, pacAlteraciones: false, inventario: false, invDisminuir: false, maestros: false, agenda: true, atenciones: true, usuarios: false },
 };
 const TIPOS_PIEL = ["seca", "normal", "mixta", "grasa"];
 const etiquetaTipoPiel = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : "—");
@@ -366,6 +366,7 @@ function Shell({ api, profile, locales, localActivo, setLocalActivo, onLogout })
   const contenido = () => {
     if (tab === "pacientes" && P.pacientes) return <Pacientes api={api} P={P} localId={localActivo} usuarioId={profile.id} />;
     if (tab === "agenda" && P.agenda) return <Agenda api={api} localId={localActivo} usuarioId={profile.id} />;
+    if (tab === "atencion" && P.atenciones) return <Atencion api={api} profile={profile} localId={localActivo} />;
     if (tab === "maestros" && P.maestros) return <Maestros api={api} localId={localActivo} />;
     if (tab === "inventario" && P.inventario) return <Inventario api={api} P={P} localId={localActivo} />;
     if (tab === "usuarios" && P.usuarios) return <Usuarios api={api} profile={profile} locales={locales} />;
@@ -1035,6 +1036,260 @@ function ModalUsuario({ usuario, usuarios, locales, onClose, onGuardar }) {
       )}
       {error && <Aviso>{error}</Aviso>}
       <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : editando ? "Guardar cambios" : "Crear usuario"}</Boton>
+    </Modal>
+  );
+}
+
+// =====================================================================
+//  Atención — registra tratamientos, descuenta inventario, cobra o deja CxC
+//  Tablas: atenciones, atencion_tratamientos, movimientos_caja,
+//  cuentas_por_cobrar, cuentas_bancarias, servicio_insumos, inventario
+// =====================================================================
+const FORMA_PAGO = [["efectivo", "Efectivo"], ["tarjeta_credito", "Tarjeta"], ["transferencia", "Transferencia"]];
+const money = (x) => `$${Number(x || 0).toFixed(2)}`;
+
+function Atencion({ api, profile, localId }) {
+  const [atenciones, setAtenciones] = useState([]);
+  const [pacientes, setPacientes] = useState([]);
+  const [servicios, setServicios] = useState([]);
+  const [personal, setPersonal] = useState([]);
+  const [cuentas, setCuentas] = useState([]);
+  const [citasPend, setCitasPend] = useState([]);
+  const [cargando, setCargando] = useState(true);
+  const [error, setError] = useState("");
+  const [aviso, setAviso] = useState("");
+  const [modal, setModal] = useState(false);
+
+  const cargar = useCallback(async () => {
+    setCargando(true); setError("");
+    try {
+      const [at, pac, serv, per, cta, cit] = await Promise.all([
+        api.select("atenciones", `local_id=eq.${localId}&select=*,pacientes(nombres,apellidos),atencion_tratamientos(nombre,precio)&order=fecha.desc&order=creado_en.desc&limit=60`),
+        api.select("pacientes", `local_id=eq.${localId}&select=id,nombres,apellidos,cedula&order=apellidos.asc`),
+        api.select("servicios", `local_id=eq.${localId}&select=id,nombre,precio,servicio_insumos(insumo_id,cantidad)&order=nombre.asc`),
+        api.select("usuario_locales", `local_id=eq.${localId}&select=usuarios(id,nombre,rol,activo)`),
+        api.select("cuentas_bancarias", `local_id=eq.${localId}&activo=eq.true&select=id,banco,numero`),
+        api.select("citas", `local_id=eq.${localId}&estado=eq.pendiente&select=id,nombre,paciente_id,profesional_id,fecha,hora,cita_tratamientos(servicio_id,nombre,precio)&order=fecha.asc`),
+      ]);
+      setAtenciones(at || []);
+      setPacientes(pac || []);
+      setServicios(serv || []);
+      setPersonal((per || []).map((r) => r.usuarios).filter((u) => u && u.activo !== false && u.rol !== "admin").sort((a, b) => a.nombre.localeCompare(b.nombre)));
+      setCuentas(cta || []);
+      setCitasPend(cit || []);
+    } catch (e) { setError("No se pudo cargar: " + e.message); }
+    setCargando(false);
+  }, [api, localId]);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  const descontarInventario = async (servicioIds) => {
+    const need = {};
+    servicioIds.forEach((sid) => {
+      const s = servicios.find((x) => x.id === sid);
+      (s?.servicio_insumos || []).forEach((b) => { need[b.insumo_id] = (need[b.insumo_id] || 0) + Number(b.cantidad || 0); });
+    });
+    const ids = Object.keys(need);
+    if (!ids.length) return;
+    const invRows = await api.select("inventario", `id=in.(${ids.join(",")})&select=id,stock`);
+    for (const row of invRows) {
+      const nuevo = Math.max(0, Number(row.stock) - need[row.id]);
+      await api.update("inventario", `id=eq.${row.id}`, { stock: nuevo });
+    }
+  };
+
+  const guardar = async (f) => {
+    try {
+      const total = f.tratamientos.reduce((s, t) => s + Number(t.precio || 0), 0);
+      const atRow = await api.insert("atenciones", {
+        local_id: localId, paciente_id: f.pacienteId, cita_id: f.citaId || null,
+        profesional_id: f.profesionalId || null, fecha: f.fecha, total,
+        notas: f.notas || null, proximo_control: f.proximoControl || null, creado_por: profile.id,
+      });
+      const atId = atRow.id;
+      await api.insert("atencion_tratamientos", f.tratamientos.map((t) => ({ atencion_id: atId, servicio_id: t.servicio_id, nombre: t.nombre, precio: t.precio })));
+      if (f.citaId) { try { await api.update("citas", `id=eq.${f.citaId}`, { estado: "atendida" }); } catch { /* no crítico */ } }
+
+      // Descontar inventario (no crítico si falla)
+      let avisoInv = "";
+      try { await descontarInventario(f.tratamientos.map((t) => t.servicio_id)); }
+      catch (e) { avisoInv = " (No se pudo descontar inventario: " + e.message + ")"; }
+
+      const abono = Math.min(Math.max(0, Number(f.abono || 0)), total);
+      const saldo = +(total - abono).toFixed(2);
+      if (abono > 0) {
+        await api.insert("movimientos_caja", {
+          local_id: localId, fecha: f.fecha, tipo: "ingreso", monto: abono, forma: f.forma,
+          cuenta_bancaria_id: f.cuentaBancariaId || null, categoria: "Atención",
+          descripcion: f.descripcion, atencion_id: atId,
+        });
+      }
+      if (saldo > 0) {
+        await api.insert("cuentas_por_cobrar", {
+          local_id: localId, paciente_id: f.pacienteId, atencion_id: atId, concepto: f.descripcion,
+          valor_original: total, saldo, estado: abono > 0 ? "parcial" : "pendiente",
+          creado_por: profile.id, ultimo_pago_en: abono > 0 ? new Date().toISOString() : null,
+        });
+      }
+      setModal(false);
+      setAviso(`Atención registrada (${money(total)}). ${abono > 0 ? `Cobrado ${money(abono)}. ` : ""}${saldo > 0 ? `Queda por cobrar ${money(saldo)}.` : "Pagado completo."}${avisoInv}`);
+      await cargar();
+      return {};
+    } catch (e) { return { error: e.message }; }
+  };
+
+  if (cargando) return <div><SectionTitle eyebrow="Clínica" title="Atención" /><Card className="p-8 text-center text-sm text-[#7C8F7E]">Cargando…</Card></div>;
+
+  return (
+    <div>
+      <SectionTitle eyebrow="Clínica" title="Atención" action={<Boton onClick={() => setModal(true)}><Plus size={16} />Nueva atención</Boton>} />
+      {error && <Aviso>{error}</Aviso>}
+      {aviso && (
+        <div className="flex items-start justify-between gap-3 mb-4 px-3 py-2 rounded-lg border" style={{ backgroundColor: "#E6EFE6", color: "#4A7350", borderColor: "#CDE0CD" }}>
+          <span className="text-sm whitespace-pre-line">{aviso}</span>
+          <button onClick={() => setAviso("")} className="shrink-0"><X size={16} /></button>
+        </div>
+      )}
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm" style={{ minWidth: "640px" }}>
+          <thead><tr className="text-left text-[#7C8F7E] text-xs uppercase tracking-wide border-b border-[#EFE9DA]" style={{ fontFamily: "'Sora', sans-serif" }}><th className="px-3 py-2.5 font-medium">Fecha</th><th className="px-3 py-2.5 font-medium">Paciente</th><th className="px-3 py-2.5 font-medium">Tratamientos</th><th className="px-3 py-2.5 font-medium text-right">Total</th><th className="px-3 py-2.5 font-medium">Próx. control</th></tr></thead>
+          <tbody>
+            {atenciones.map((a) => (
+              <tr key={a.id} className="border-b border-[#F4EFE2]">
+                <td className="px-3 py-2.5 text-[#7C8F7E]">{a.fecha}</td>
+                <td className="px-3 py-2.5 text-[#2E2E2E]">{a.pacientes ? `${a.pacientes.nombres} ${a.pacientes.apellidos}` : "—"}</td>
+                <td className="px-3 py-2.5 text-xs text-[#7C9885]">{(a.atencion_tratamientos || []).map((t) => t.nombre).join(", ") || "—"}</td>
+                <td className="px-3 py-2.5 text-right text-[#2E2E2E]">{money(a.total)}</td>
+                <td className="px-3 py-2.5 text-[#7C8F7E]">{a.proximo_control || "—"}</td>
+              </tr>
+            ))}
+            {atenciones.length === 0 && <tr><td colSpan={5} className="px-3 py-6 text-center text-[#7C8F7E]">Aún no hay atenciones.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+      {modal && <ModalAtencion pacientes={pacientes} servicios={servicios} personal={personal} cuentas={cuentas} citasPend={citasPend} onClose={() => setModal(false)} onGuardar={guardar} />}
+    </div>
+  );
+}
+
+function ModalAtencion({ pacientes, servicios, personal, cuentas, citasPend, onClose, onGuardar }) {
+  const [busca, setBusca] = useState("");
+  const [pacienteId, setPacienteId] = useState("");
+  const [citaId, setCitaId] = useState("");
+  const [profesionalId, setProfesionalId] = useState("");
+  const [fecha, setFecha] = useState(_hoyISO());
+  const [tratamientos, setTratamientos] = useState([]);
+  const [servSel, setServSel] = useState("");
+  const [notas, setNotas] = useState("");
+  const [proximoControl, setProximoControl] = useState("");
+  const [abono, setAbono] = useState("");
+  const [forma, setForma] = useState("efectivo");
+  const [cuentaBancariaId, setCuentaBancariaId] = useState("");
+  const [error, setError] = useState("");
+  const [guardando, setGuardando] = useState(false);
+
+  const total = tratamientos.reduce((s, t) => s + Number(t.precio || 0), 0);
+  const abonoNum = Math.min(Math.max(0, Number(abono === "" ? total : abono)), total);
+  const saldo = +(total - abonoNum).toFixed(2);
+
+  const pacFiltrados = pacientes.filter((p) => { const q = busca.trim().toLowerCase(); return !q || `${p.nombres} ${p.apellidos}`.toLowerCase().includes(q) || (p.cedula || "").includes(busca); });
+  const pacienteSel = pacientes.find((p) => p.id === pacienteId);
+
+  const addServ = (id) => {
+    setServSel("");
+    const s = servicios.find((x) => x.id === id); if (!s) return;
+    setTratamientos((t) => [...t, { servicio_id: s.id, nombre: s.nombre, precio: Number(s.precio) }]);
+  };
+  const setPrecio = (i, v) => setTratamientos((t) => t.map((r, j) => (j === i ? { ...r, precio: parseFloat(v) || 0 } : r)));
+  const delServ = (i) => setTratamientos((t) => t.filter((_, j) => j !== i));
+
+  const elegirCita = (id) => {
+    setCitaId(id);
+    const c = citasPend.find((x) => x.id === id); if (!c) return;
+    if (c.paciente_id) setPacienteId(c.paciente_id);
+    if (c.profesional_id) setProfesionalId(c.profesional_id);
+    if ((c.cita_tratamientos || []).length) setTratamientos(c.cita_tratamientos.map((t) => ({ servicio_id: t.servicio_id, nombre: t.nombre, precio: Number(t.precio) })));
+  };
+
+  const submit = async () => {
+    if (!pacienteId) { setError("Elige el paciente."); return; }
+    if (tratamientos.length === 0) { setError("Agrega al menos un tratamiento."); return; }
+    setError(""); setGuardando(true);
+    const descripcion = `${pacienteSel ? pacienteSel.nombres + " " + pacienteSel.apellidos : ""} — ${tratamientos.map((t) => t.nombre).join(", ")}`;
+    const res = await onGuardar({ pacienteId, citaId, profesionalId, fecha, tratamientos, notas, proximoControl, abono: abono === "" ? total : abono, forma, cuentaBancariaId, descripcion });
+    setGuardando(false);
+    if (res?.error) setError(res.error);
+  };
+
+  return (
+    <Modal title="Nueva atención" onClose={onClose} wide>
+      {citasPend.length > 0 && (
+        <Field label="Vincular una cita pendiente (opcional)">
+          <select value={citaId} onChange={(e) => elegirCita(e.target.value)} className={inputClass}>
+            <option value="">No vincular</option>
+            {citasPend.map((c) => <option key={c.id} value={c.id}>{c.fecha} {c.hora} · {c.nombre || "cita"}</option>)}
+          </select>
+        </Field>
+      )}
+
+      <div className="text-[12px] tracking-[0.12em] uppercase mb-2" style={{ color: "#7C9885", fontFamily: "'Sora', sans-serif" }}>Paciente</div>
+      {!pacienteId ? (
+        <>
+          <div className="relative mb-2"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A9B9AA]" /><input value={busca} onChange={(e) => setBusca(e.target.value)} placeholder="Buscar por nombre o cédula…" className={`${inputClass} pl-9`} /></div>
+          <div className="max-h-40 overflow-y-auto rounded-lg border border-[#E7E1D2] mb-4">
+            {pacFiltrados.slice(0, 30).map((p) => <button key={p.id} onClick={() => setPacienteId(p.id)} className="block w-full text-left px-3 py-2 text-sm hover:bg-[#FBF9F3] border-b border-[#F4EFE2]" style={{ color: "#2E2E2E" }}>{p.nombres} {p.apellidos} <span className="text-xs" style={{ color: "#A9B9AA" }}>{p.cedula || ""}</span></button>)}
+            {pacFiltrados.length === 0 && <div className="px-3 py-3 text-sm text-[#A9B9AA]">Sin coincidencias.</div>}
+          </div>
+        </>
+      ) : (
+        <div className="flex items-center justify-between mb-4 px-3 py-2 rounded-lg" style={{ backgroundColor: "#F2F6F0", border: "1px solid #CDE0CD" }}>
+          <span className="text-sm" style={{ color: "#2E2E2E" }}>{pacienteSel ? `${pacienteSel.nombres} ${pacienteSel.apellidos}` : ""}</span>
+          <button onClick={() => setPacienteId("")} className="text-xs" style={{ color: "#7C9885" }}>Cambiar</button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="Quién atendió (opcional)"><select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className={inputClass}><option value="">Sin asignar</option>{personal.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</select></Field>
+        <Field label="Fecha"><input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputClass} /></Field>
+      </div>
+
+      <div className="text-[12px] tracking-[0.12em] uppercase mb-2" style={{ color: "#7C9885", fontFamily: "'Sora', sans-serif" }}>Tratamientos</div>
+      <div className="flex items-center gap-2 mb-2">
+        <select value={servSel} onChange={(e) => e.target.value && addServ(e.target.value)} className={inputClass} style={{ flex: 1 }}>
+          <option value="">Agregar tratamiento…</option>
+          {servicios.map((s) => <option key={s.id} value={s.id}>{s.nombre} — {money(s.precio)}</option>)}
+        </select>
+      </div>
+      <div className="space-y-2 mb-2">
+        {tratamientos.map((t, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <span className="text-sm flex-1" style={{ color: "#2E2E2E" }}>{t.nombre}</span>
+            <span className="text-xs" style={{ color: "#A9B9AA" }}>$</span>
+            <input type="number" min="0" step="0.5" value={t.precio} onChange={(e) => setPrecio(i, e.target.value)} className={inputClass} style={{ width: "90px" }} />
+            <button onClick={() => delServ(i)} className="text-[#B4694F] shrink-0"><X size={16} /></button>
+          </div>
+        ))}
+        {tratamientos.length === 0 && <p className="text-xs text-[#A9B9AA]">Sin tratamientos aún.</p>}
+      </div>
+      <div className="text-right text-sm mb-4" style={{ color: "#2E2E2E" }}>Total: <b>{money(total)}</b></div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="Notas (opcional)"><textarea value={notas} onChange={(e) => setNotas(e.target.value)} rows={2} className={inputClass} /></Field>
+        <Field label="Próximo control (opcional)"><input type="date" value={proximoControl} onChange={(e) => setProximoControl(e.target.value)} className={inputClass} /></Field>
+      </div>
+
+      <div className="border-t border-[#E7E1D2] my-3" />
+      <div className="text-[12px] tracking-[0.12em] uppercase mb-2" style={{ color: "#7C9885", fontFamily: "'Sora', sans-serif" }}>Pago</div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <Field label={`Paga ahora (total ${money(total)})`}><input type="number" min="0" step="0.5" value={abono} onChange={(e) => setAbono(e.target.value)} placeholder={total.toFixed(2)} className={inputClass} /></Field>
+        <Field label="Forma de pago"><select value={forma} onChange={(e) => setForma(e.target.value)} className={inputClass} disabled={abonoNum <= 0}>{FORMA_PAGO.map(([v, t]) => <option key={v} value={v}>{t}</option>)}</select></Field>
+        <Field label="Cuenta bancaria (opcional)"><select value={cuentaBancariaId} onChange={(e) => setCuentaBancariaId(e.target.value)} className={inputClass} disabled={abonoNum <= 0}><option value="">—</option>{cuentas.map((c) => <option key={c.id} value={c.id}>{c.banco} {c.numero || ""}</option>)}</select></Field>
+      </div>
+      <div className="text-sm mb-4" style={{ color: saldo > 0 ? "#B4694F" : "#4A7350" }}>
+        {saldo > 0 ? `Quedará en Cuentas por Cobrar: ${money(saldo)}` : "Pago completo — no genera cuenta por cobrar."}
+      </div>
+
+      {error && <Aviso>{error}</Aviso>}
+      <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : "Registrar atención"}</Boton>
     </Modal>
   );
 }
