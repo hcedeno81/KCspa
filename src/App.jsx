@@ -400,6 +400,7 @@ function Shell({ api, profile, locales, localActivo, setLocalActivo, onLogout })
           <div className="text-gray-300 text-xs mb-1">{ROLES[rol]}</div>
           <div className="text-xs mb-3" style={{ color: "#A9B9AA" }}>📍 {localNombre}</div>
           <button onClick={onLogout} className="text-xs hover:underline" style={{ color: "#E3A48E" }}>Cerrar sesión</button>
+          <div className="text-[10px] mt-3" style={{ color: "#6B6B6B" }}>{APP_VERSION}</div>
         </div></div>
       </aside>
       <main className="flex-1 p-4 sm:p-6 md:p-8 max-w-6xl pb-20 md:pb-8">{contenido()}</main>
@@ -1047,6 +1048,7 @@ function ModalUsuario({ usuario, usuarios, locales, onClose, onGuardar }) {
 // =====================================================================
 const FORMA_PAGO = [["efectivo", "Efectivo"], ["tarjeta_credito", "Tarjeta"], ["transferencia", "Transferencia"]];
 const money = (x) => `$${Number(x || 0).toFixed(2)}`;
+const APP_VERSION = "v3 · 2026-08-11 (sin 'profesional', con Atención)";
 
 function Atencion({ api, profile, localId }) {
   const [atenciones, setAtenciones] = useState([]);
