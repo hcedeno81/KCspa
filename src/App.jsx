@@ -792,16 +792,18 @@ function Agenda({ api, localId, usuarioId }) {
     try {
       const [cit, prof, serv] = await Promise.all([
         api.select("citas", `local_id=eq.${localId}&select=*,cita_tratamientos(id,servicio_id,nombre,precio)&order=fecha.asc&order=hora.asc`),
-        api.select("usuarios", "rol=eq.cosmetologa&select=id,nombre,profesional,rol"),
+        api.select("usuario_locales", `local_id=eq.${localId}&select=usuarios(id,nombre,rol,activo)`),
         api.select("servicios", `local_id=eq.${localId}&select=id,nombre,precio,duracion&order=nombre.asc`),
       ]);
-      setCitas(cit || []); setProfesionales(prof || []); setServicios(serv || []);
+      setCitas(cit || []);
+      setProfesionales((prof || []).map((r) => r.usuarios).filter((u) => u && u.activo !== false && u.rol !== "admin").sort((a, b) => a.nombre.localeCompare(b.nombre)));
+      setServicios(serv || []);
     } catch (e) { setError("No se pudieron cargar las citas: " + e.message); }
     setCargando(false);
   }, [api, localId]);
   useEffect(() => { cargar(); }, [cargar]);
 
-  const nombreProf = (id) => { const p = profesionales.find((x) => x.id === id); return p ? (p.profesional || p.nombre) : "Sin asignar"; };
+  const nombreProf = (id) => { const p = profesionales.find((x) => x.id === id); return p ? p.nombre : "Sin asignar"; };
   const [desde, hasta] = _rango(ancla, vista);
   const hayBusqueda = buscar.trim().length > 0; const q = buscar.trim().toLowerCase();
   const visibles = useMemo(() => citas.filter((c) => estadoF === "todas" || c.estado === estadoF).filter((c) => hayBusqueda || (c.fecha >= desde && c.fecha <= hasta)).filter((c) => !hayBusqueda || (c.nombre || "").toLowerCase().includes(q) || (c.telefono || "").includes(buscar)), [citas, estadoF, hayBusqueda, q, buscar, desde, hasta]);
@@ -898,7 +900,7 @@ function ModalCita({ cita, profesionales, servicios, citas, onClose, onGuardar }
       <p className="text-xs mb-4" style={{ color: "#7C8F7E" }}>Cita rápida: basta el nombre y el teléfono.</p>
       <Field label="Nombre de quien reserva"><input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputClass} autoFocus /></Field>
       <Field label="Teléfono (opcional)"><input value={telefono} onChange={(e) => setTelefono(e.target.value)} className={inputClass} /></Field>
-      <Field label="Profesional (opcional)"><select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className={inputClass}><option value="">Sin asignar</option>{profesionales.map((p) => <option key={p.id} value={p.id}>{p.profesional || p.nombre}</option>)}</select></Field>
+      <Field label="Quién atiende (opcional)"><select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className={inputClass}><option value="">Sin asignar</option>{profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</select></Field>
       <Field label="Motivo / tratamiento (opcional)"><select value={servicioId} onChange={(e) => elegirServicio(e.target.value)} className={inputClass}><option value="">Ninguno</option>{servicios.map((s) => <option key={s.id} value={s.id}>{s.nombre} — ${Number(s.precio).toFixed(2)}</option>)}</select></Field>
       <div className="grid grid-cols-3 gap-3"><Field label="Fecha"><input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputClass} /></Field><Field label="Hora"><input type="time" value={hora} onChange={(e) => setHora(e.target.value)} className={inputClass} /></Field><Field label="Duración"><select value={duracion} onChange={(e) => setDuracion(parseInt(e.target.value))} className={inputClass}>{[15, 20, 30, 40, 45, 50, 60, 75, 90, 120].map((d) => <option key={d} value={d}>{d} min</option>)}</select></Field></div>
       <p className="text-xs -mt-1 mb-2" style={{ color: "#7C9885" }}>Termina aprox. a las {_horaFin(hora, duracion)}</p>
@@ -938,9 +940,9 @@ function Usuarios({ api, profile, locales }) {
     try {
       let userId = editandoId;
       if (editandoId) {
-        await api.update("usuarios", `id=eq.${editandoId}`, { username: form.username, password: form.password, nombre: form.nombre, rol: form.rol, profesional: form.rol === "cosmetologa" ? form.profesional : null });
+        await api.update("usuarios", `id=eq.${editandoId}`, { username: form.username, password: form.password, nombre: form.nombre, rol: form.rol });
       } else {
-        const row = await api.insert("usuarios", { id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())), username: form.username, password: form.password, nombre: form.nombre, rol: form.rol, activo: true, debe_cambiar_password: false, profesional: form.rol === "cosmetologa" ? form.profesional : null });
+        const row = await api.insert("usuarios", { id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())), username: form.username, password: form.password, nombre: form.nombre, rol: form.rol, activo: true, debe_cambiar_password: false });
         userId = row.id;
       }
       await api.remove("usuario_locales", `usuario_id=eq.${userId}`);
@@ -998,7 +1000,6 @@ function ModalUsuario({ usuario, usuarios, locales, onClose, onGuardar }) {
   const [password, setPassword] = useState(usuario?.password ?? "");
   const [nombre, setNombre] = useState(usuario?.nombre ?? "");
   const [rol, setRol] = useState(usuario?.rol ?? "asistente");
-  const [profesional, setProfesional] = useState(usuario?.profesional ?? "");
   const [locSel, setLocSel] = useState((usuario?.usuario_locales || []).map((x) => x.local_id));
   const [error, setError] = useState(""); const [guardando, setGuardando] = useState(false);
   const rolesDisponibles = ["admin", ...ROLES_ASIGNABLES];
@@ -1009,9 +1010,8 @@ function ModalUsuario({ usuario, usuarios, locales, onClose, onGuardar }) {
     const dup = usuarios.some((u) => (u.username || "").toLowerCase() === username.trim().toLowerCase() && u.id !== usuario?.id);
     if (dup) { setError("Ese usuario ya existe."); return; }
     if (rol !== "admin" && locSel.length === 0) { setError("Selecciona al menos un local."); return; }
-    if (rol === "cosmetologa" && !profesional.trim()) { setError("Indica el nombre de la profesional."); return; }
     setError(""); setGuardando(true);
-    const res = await onGuardar({ username: username.trim(), password: password.trim(), nombre: nombre.trim(), rol, profesional: profesional.trim(), locales: rol === "admin" ? [] : locSel }, usuario?.id);
+    const res = await onGuardar({ username: username.trim(), password: password.trim(), nombre: nombre.trim(), rol, locales: rol === "admin" ? [] : locSel }, usuario?.id);
     setGuardando(false); if (res?.error) setError(res.error);
   };
 
@@ -1033,7 +1033,6 @@ function ModalUsuario({ usuario, usuarios, locales, onClose, onGuardar }) {
           </div>
         </div>
       )}
-      {rol === "cosmetologa" && <Field label="Profesional vinculada"><input value={profesional} onChange={(e) => setProfesional(e.target.value)} className={inputClass} placeholder="ej. Grace" /></Field>}
       {error && <Aviso>{error}</Aviso>}
       <Boton onClick={submit} disabled={guardando}>{guardando ? "Guardando…" : editando ? "Guardar cambios" : "Crear usuario"}</Boton>
     </Modal>
